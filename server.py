@@ -11,6 +11,8 @@ from typing import Annotated
 import httpx
 from bs4 import BeautifulSoup
 from mcp.server.mcpserver.server import MCPServer
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
 # ── Typesense endpoints ────────────────────────────────────────────────────────
 
@@ -29,7 +31,25 @@ _SORT_BY = "item_priority:desc,_text_match:desc"
 
 # ── App ────────────────────────────────────────────────────────────────────────
 
-mcp = MCPServer("ignition-doc-mcp")
+# Every tool here reads public documentation over the network: no side effects,
+# and results depend on what Inductive Automation currently publishes.
+READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=True)
+
+mcp = MCPServer(
+    "ignition-doc-mcp",
+    instructions=(
+        "Answers questions about Inductive Automation Ignition from the official "
+        "documentation, always the latest published version. Use "
+        "search_ignition_docs for using and configuring Ignition, and "
+        "search_ignition_sdk for writing Java modules against the SDK, then "
+        "get_page to read any promising result in full — search returns excerpts "
+        "that usually omit the actual steps. Results are tagged with the doc "
+        "version from their URL and can span 7.9 through 8.3, so check it before "
+        "relying on a page. Prefer these tools over recalled knowledge: Ignition "
+        "changes between versions and details drift. All tools are read-only and "
+        "need no credentials."
+    ),
+)
 _client: httpx.AsyncClient | None = None
 
 
@@ -83,6 +103,15 @@ async def _typesense_search(
     return resp.json().get("hits", [])
 
 
+_VERSION_IN_URL = re.compile(r"/docs/(\d+\.\d+)/")
+
+
+def _version_of(url: str) -> str:
+    """Ignition puts the doc version in the URL path, e.g. /docs/8.1/..."""
+    m = _VERSION_IN_URL.search(url)
+    return m.group(1) if m else "?"
+
+
 def _format_hits(hits: list[dict], n: int) -> str:
     lines: list[str] = []
     seen: set[str] = set()
@@ -101,7 +130,7 @@ def _format_hits(hits: list[dict], n: int) -> str:
         title = " > ".join(parts) if parts else page_url
         snippet = doc.get("content", "")[:200].strip()
 
-        lines.append(f"{count + 1}. {title}")
+        lines.append(f"{count + 1}. {title}  [v{_version_of(page_url)}]")
         lines.append(f"   {page_url}")
         if snippet:
             lines.append(f"   {snippet}")
@@ -112,16 +141,36 @@ def _format_hits(hits: list[dict], n: int) -> str:
 
 # ── Tools ──────────────────────────────────────────────────────────────────────
 
-@mcp.tool()
+@mcp.tool(
+    description=(
+        "Search the Ignition User Manual and return page titles, URLs and "
+        "matching excerpts.\n\n"
+        "Use this for how Ignition is used and configured: tags and the tag "
+        "historian, OPC-UA connections, Perspective and Vision, gateway and "
+        "designer settings, Jython scripting, alarms, security, and installation. "
+        "Use search_ignition_sdk instead when the question is about writing a Java "
+        "module against Ignition's API. Reach for this before answering from "
+        "memory — Ignition's behaviour and UI shift between versions.\n\n"
+        "Read-only; no side effects; no credentials needed. Results carry a "
+        "[v8.1]-style version tag read from the page URL: the upstream index "
+        "labels some older pages as current, so results can mix 7.9, 8.1 and 8.3 "
+        "and you should check the version before relying on one. Excerpts are "
+        "short and often omit the steps themselves — follow up with get_page on "
+        "the URL that looks right."
+    ),
+    annotations=READ_ONLY,
+)
 async def search_ignition_docs(
-    query: Annotated[str, "Search terms, e.g. 'configure OPC-UA connection' or 'tag historian deadband'"],
-    n_results: Annotated[int, "Number of unique pages to return (default 5, max 20)"] = 5,
+    query: Annotated[str, Field(description=(
+        "Search terms describing the task or setting, e.g. 'configure OPC-UA "
+        "connection' or 'tag historian deadband'. Plain keywords work better "
+        "than a full question."
+    ))],
+    n_results: Annotated[int, Field(
+        default=5, ge=1, le=20,
+        description="Number of unique pages to return, 1-20.",
+    )] = 5,
 ) -> str:
-    """Search the Ignition User Manual (always the latest version).
-
-    Use this for questions about Ignition configuration, tags, scripting,
-    modules, gateways, designers, and general product usage.
-    """
     n = min(n_results, 20)
     hits = await _typesense_search(
         _DOCS_HOST, _DOCS_KEY, _DOCS_COLLECTION,
@@ -131,20 +180,41 @@ async def search_ignition_docs(
     result = _format_hits(hits, n)
     if not result:
         return f"No results found for: {query}"
-    return f"Ignition User Manual — latest (8.3)\n\n{result}"
+    return (
+        "Ignition User Manual. Each result is tagged with the doc version taken "
+        "from its URL; Inductive Automation's index labels some older pages as "
+        "current, so check the version before relying on a result.\n\n"
+        f"{result}"
+    )
 
 
-@mcp.tool()
+@mcp.tool(
+    description=(
+        "Search the Ignition SDK Programmer's Guide and return page titles, URLs "
+        "and matching excerpts.\n\n"
+        "Use this when writing or debugging an Ignition module in Java: the hook "
+        "classes (GatewayModuleHook, DesignerModuleHook, ClientModuleHook, "
+        "AbstractGatewayModuleHook), module lifecycle and .modl packaging, custom "
+        "tag providers, RPC between scopes, and Perspective or Vision component "
+        "development. Use search_ignition_docs instead for configuring or "
+        "operating Ignition itself; that is the far more common need, so prefer it "
+        "unless the question is clearly about module code.\n\n"
+        "Read-only; no side effects; no credentials needed. Covers only the SDK "
+        "guide, not the user manual or Javadoc. Follow up with get_page to read a "
+        "result in full."
+    ),
+    annotations=READ_ONLY,
+)
 async def search_ignition_sdk(
-    query: Annotated[str, "Search terms, e.g. 'GatewayModuleHook startup' or 'tag provider SDK'"],
-    n_results: Annotated[int, "Number of unique pages to return (default 5, max 20)"] = 5,
+    query: Annotated[str, Field(description=(
+        "Search terms, ideally naming an SDK class or concept, e.g. "
+        "'GatewayModuleHook startup' or 'tag provider SDK'."
+    ))],
+    n_results: Annotated[int, Field(
+        default=5, ge=1, le=20,
+        description="Number of unique pages to return, 1-20.",
+    )] = 5,
 ) -> str:
-    """Search the Ignition SDK Programmer's Guide.
-
-    Use this for questions about building Ignition modules: GatewayModuleHook,
-    DesignerModuleHook, ClientModuleHook, AbstractGatewayModuleHook, and the
-    Ignition module API.
-    """
     n = min(n_results, 20)
     hits = await _typesense_search(
         _SDK_HOST, _SDK_KEY, _SDK_COLLECTION,
@@ -156,15 +226,34 @@ async def search_ignition_sdk(
     return f"Ignition SDK Programmer's Guide\n\n{result}"
 
 
-@mcp.tool()
+@mcp.tool(
+    description=(
+        "Fetch one Ignition documentation page and return its text.\n\n"
+        "Use this after either search tool, on any result whose excerpt looks "
+        "relevant — excerpts are a couple of lines and routinely omit the actual "
+        "configuration steps or code, so do not answer from a search result alone. "
+        "Also accepts any docs.inductiveautomation.com or "
+        "sdk-docs.inductiveautomation.com URL the user pastes.\n\n"
+        "Read-only; no side effects; no credentials needed. Any anchor is stripped "
+        "so the whole page is returned, not just one section. Output is the URL "
+        "followed by the page text, truncated at max_chars with a marker when cut."
+    ),
+    annotations=READ_ONLY,
+)
 async def get_page(
-    url: Annotated[str, "Full page URL from search results"],
-    max_chars: Annotated[int, "Max characters to return (default 4000, max 12000)"] = 4000,
+    url: Annotated[str, Field(description=(
+        "Full page URL, normally copied from a search result, e.g. "
+        "'https://docs.inductiveautomation.com/docs/8.3/platform/tags/tag-historian'. "
+        "Any '#section' anchor is ignored."
+    ))],
+    max_chars: Annotated[int, Field(
+        default=4000, ge=500, le=12000,
+        description=(
+            "Maximum characters of page text to return, 500-12000. Raise it if "
+            "the output ends in a truncation marker."
+        ),
+    )] = 4000,
 ) -> str:
-    """Fetch the text content of an Ignition documentation page by URL.
-
-    Use URLs returned by search_ignition_docs or search_ignition_sdk.
-    """
     url = url.split("#")[0]  # strip anchor — fetch the full page
     max_chars = min(max_chars, 12000)
 
